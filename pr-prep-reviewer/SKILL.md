@@ -31,11 +31,26 @@ Automate PR preparation and review. Two distinct modes — detect which one the 
 
 Run these checks in order. Stop and report if any critical check fails.
 
+**1.0 Check git is installed**
+```bash
+git --version 2>&1
+```
+If command not found → stop: `Git is not installed. Install it from https://git-scm.com and retry.`
+If version is below 2.x → warn: `⚠ Git version is outdated. Some commands may behave unexpectedly. Consider upgrading.`
+
 **1.1 Verify git repo**
 ```bash
 git rev-parse --is-inside-work-tree
 ```
 If not a git repo → stop with: `Not inside a git repository. Navigate to your project root and retry.`
+
+**1.1a Check remote named `origin` exists**
+```bash
+git remote get-url origin 2>&1
+```
+- If `origin` not found → list all remotes: `git remote -v`
+  - If other remotes exist (e.g. `upstream`, `fork`) → ask user: `No remote named 'origin' found. Available remotes: [list]. Which one should be used as origin?`
+  - If no remotes at all → stop: `No remotes configured. Add one with: git remote add origin <url>`
 
 **1.2 Detect detached HEAD**
 ```bash
@@ -73,7 +88,20 @@ git status --porcelain
 git fetch origin 2>&1
 git ls-remote --heads origin TARGET_BRANCH
 ```
-If target branch not found on remote → stop: `Target branch 'TARGET_BRANCH' not found on remote. Check the branch name.`
+Inspect fetch output before proceeding:
+- If output contains `Permission denied` or `Authentication failed` → stop:
+  ```
+  ⚠ Remote authentication failed. Possible fixes:
+    - SSH: run `ssh-add ~/.ssh/id_rsa` (or your key path)
+    - HTTPS: run `git credential approve` or re-enter credentials
+    - Check remote URL: git remote get-url origin
+  ```
+- If output contains `Could not resolve host` or `network` errors → warn:
+  ```
+  ⚠ Could not reach remote. Continuing with local cache — remote state may be stale.
+  ```
+  Continue with locally cached `origin/TARGET_BRANCH` if it exists; otherwise stop.
+- If target branch not found on remote → stop: `Target branch 'TARGET_BRANCH' not found on remote. Check the branch name.`
 
 **1.7 Check if current branch already merged**
 ```bash
@@ -82,10 +110,27 @@ git branch -r --merged origin/TARGET_BRANCH | grep CURRENT_BRANCH
 If found → warn: `⚠ Branch 'CURRENT_BRANCH' appears to already be merged into TARGET_BRANCH.`
 
 **1.8 Check if PR already exists (if gh CLI available)**
+
+First verify gh CLI is authenticated:
 ```bash
-which gh && gh pr list --head CURRENT_BRANCH --base TARGET_BRANCH --state open 2>/dev/null
+which gh 2>/dev/null && gh auth status 2>&1
+```
+- If gh not installed → skip steps 1.8 and 1.9 silently.
+- If `gh auth status` fails → warn: `⚠ gh CLI is installed but not authenticated. Run: gh auth login` — then skip PR detection.
+
+If gh is available and authenticated:
+```bash
+gh pr list --head CURRENT_BRANCH --base TARGET_BRANCH --state open 2>/dev/null
 ```
 If open PR exists → warn with PR link: `⚠ An open PR already exists for CURRENT_BRANCH → TARGET_BRANCH: [URL]`
+
+**1.9 Check for already merged or closed PR**
+```bash
+gh pr list --head CURRENT_BRANCH --base TARGET_BRANCH --state merged 2>/dev/null
+gh pr list --head CURRENT_BRANCH --base TARGET_BRANCH --state closed 2>/dev/null
+```
+If merged PR found → warn: `⚠ A PR from CURRENT_BRANCH into TARGET_BRANCH was already merged. Verify this is intentional (e.g. re-work or hotfix).`
+If closed (not merged) PR found → warn: `⚠ A previously closed (unmerged) PR exists for this branch. You may be re-raising a previously rejected change.`
 
 ---
 
@@ -163,7 +208,27 @@ git diff --name-only --diff-filter=U | xargs file 2>/dev/null | grep -v "text"
 ```
 If binary conflicts found → call out specifically: `Binary file conflicts require manual resolution: [files]`
 
-**2.7 Check if diff is empty after sync**
+**2.7 Restore stash if it was auto-applied (step 1.5)**
+```bash
+git stash pop
+```
+If stash pop results in conflicts:
+```bash
+git diff --name-only --diff-filter=U
+```
+If conflicts found → warn immediately:
+```
+⚠ Auto-stash restore caused conflicts. Your stash was NOT automatically applied cleanly.
+Conflicted files:
+  • [list files]
+To resolve:
+  1. Fix conflicts in each file listed above
+  2. Run: git stash drop stash@{0}   (once you're done)
+  Your original uncommitted changes are still in: git stash show stash@{0}
+```
+Do not continue silently — always surface stash pop failures.
+
+**2.8 Check if diff is empty after sync**
 ```bash
 git diff origin/TARGET_BRANCH --name-only
 ```
@@ -174,6 +239,19 @@ If empty → warn: `⚠ No diff detected between CURRENT_BRANCH and TARGET_BRANC
 ### Phase 3: Change Analysis
 
 Run all analysis commands in parallel where possible.
+
+**3.0 Guard: verify commits exist ahead of target**
+```bash
+git rev-list --count origin/TARGET_BRANCH..HEAD
+```
+If count is 0 → warn and stop:
+```
+⚠ No commits found ahead of TARGET_BRANCH.
+Your branch has no new commits to include in a PR.
+Make sure you are on the correct branch, or that your commits have been pushed:
+  git log --oneline -5
+```
+Do not proceed to generate PR content for an empty commit range.
 
 **3.1 Get commit log**
 ```bash
@@ -198,6 +276,15 @@ Categorize files mentally:
 - CI/CD (`.github/`, `.gitlab-ci.yml`, `Jenkinsfile`)
 - Dependencies (`package.json`, `go.mod`, `requirements.txt`, `Gemfile`)
 - Assets (images, fonts, static files)
+
+**Auto-filter noise files before analysis:**
+The following file types must be excluded from diff analysis and review. Note them separately as "excluded" but never analyze their content:
+- Lock files: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Gemfile.lock`, `poetry.lock`, `go.sum`
+- Generated/compiled: `dist/`, `build/`, `out/`, `*.min.js`, `*.min.css`, `*.bundle.js`
+- Binary files: images (`.png`, `.jpg`, `.gif`, `.ico`, `.svg` with binary content), fonts (`.woff`, `.ttf`, `.eot`)
+
+If lock files are the *only* changed files → classify as `dependency-bump` and note: `[Lock file only — dependency versions updated]`
+If generated/binary files dominate (>80% of changed files) → warn: `⚠ Most changed files are generated or binary. Ensure source files were also committed.`
 
 **3.4 Read diff content for key changed files**
 ```bash
@@ -355,20 +442,50 @@ Used to review a PR diff before or after it is raised.
 ```bash
 git diff origin/TARGET_BRANCH..HEAD
 ```
+Before fetching diff, check 0-commits guard:
+```bash
+git rev-list --count origin/TARGET_BRANCH..HEAD
+```
+If count is 0 → stop: `⚠ No commits ahead of TARGET_BRANCH. Nothing to review.`
 
 **Option B — User pastes diff** → analyze pasted content directly
 
-**Option C — PR URL provided (if gh CLI available)**
+**Option C — PR URL or PR number provided**
+
+First check if gh CLI is available and authenticated:
 ```bash
-gh pr diff PR_NUMBER
-gh pr view PR_NUMBER
+which gh 2>/dev/null && gh auth status 2>&1
 ```
+- If gh available and authenticated:
+  ```bash
+  gh pr diff PR_NUMBER
+  gh pr view PR_NUMBER
+  ```
+- If gh not installed or not authenticated → do not stop. Fall back:
+  ```
+  ⚠ gh CLI is not available or not authenticated. Cannot fetch PR diff automatically.
+  Please paste the diff directly into the chat:
+    1. Open the PR on GitHub
+    2. Click "Files changed"
+    3. Copy the diff content and paste it here
+  ```
 
 ### Phase 2: Load Review Checklist
 
 Read `references/review-checklist.md` fully before reviewing. It contains all criteria by category.
 
 ### Phase 3: Systematic Review
+
+**Pre-review filter — exclude noise files:**
+Before analyzing, remove the following from scope and note them as excluded:
+- Lock files: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum`, etc.
+- Compiled/minified: `*.min.js`, `*.min.css`, `dist/`, `build/`, `*.bundle.*`
+- Binary files: images, fonts, compiled artifacts
+
+If any of the above are present in the diff, state at the top of the review:
+```
+📎 Excluded from review (noise/generated): [list files]
+```
 
 Analyze the diff against every category in the checklist:
 
@@ -451,6 +568,15 @@ PR REVIEW REPORT
 
 The skill reads `.pr-agent.yml` from the repo root if present. All fields are optional with sensible defaults.
 
+**Config parse error fallback:**
+If `.pr-agent.yml` exists but contains invalid YAML or unrecognized keys → warn and continue with defaults:
+```
+⚠ Could not parse .pr-agent.yml — using built-in defaults.
+Error: [describe parse issue]
+Fix: validate your YAML at https://yaml-online-parser.appspot.com
+```
+Never stop execution due to a malformed config file.
+
 ```yaml
 # .pr-agent.yml — PR Agent Configuration
 # Place this file in your repo root
@@ -519,24 +645,37 @@ review:
 
 | Situation | Action |
 |-----------|--------|
+| Git not installed | Stop, give install link |
+| Git version < 2.x | Warn about potential command failures |
 | Not in a git repo | Stop immediately with clear message |
 | Detached HEAD | Stop, tell user to checkout a branch |
 | Current branch = target branch | Stop, cannot PR to self |
+| `origin` remote missing | List available remotes, ask which to use |
+| No remotes at all | Stop, instruct to add remote |
 | Uncommitted changes | Warn, ask user: stash / commit / abort |
+| Stash pop causes conflicts | Warn explicitly, show conflicted files, do not hide |
 | Target branch not on remote | Stop, verify branch name |
 | Branch already merged | Warn, may be duplicate work |
 | PR already open | Warn with existing PR link |
+| PR previously merged | Warn: may be re-work or duplicate |
+| PR previously closed (unmerged) | Warn: previously rejected change |
+| gh CLI not authenticated | Warn, suggest `gh auth login`, skip PR detection |
+| gh CLI not available | Skip PR detection, skip PR creation commands |
+| Fetch authentication failure (SSH/HTTPS) | Stop with specific fix instructions |
+| Fetch network failure | Warn, continue with local cache if available |
 | Merge conflict detected | Stop, abort merge/rebase, show conflict details |
 | Binary file conflict | Call out explicitly |
 | Empty diff after sync | Warn, may be no-op PR |
+| 0 commits ahead of target | Stop, warn branch has nothing to PR |
 | Branch 50+ commits behind | Warn before syncing |
+| Lock files only changed | Classify as dependency-bump automatically |
+| Generated/binary files dominate diff | Warn, check source files were committed |
 | Poor commit messages | Derive title/desc from diff, label as inferred |
 | Mixed-purpose PR | Split description clearly by concern |
 | Secret detected in diff | Flag immediately as CRITICAL in review |
 | No README exists | Create minimal one for features only |
 | Monorepo | Check both root and package-level README |
-| gh CLI not available | Skip PR detection, skip PR creation commands |
-| Fetch fails | Warn about network/auth, continue with local state if possible |
+| `.pr-agent.yml` parse error | Warn, continue with built-in defaults |
 
 ---
 
