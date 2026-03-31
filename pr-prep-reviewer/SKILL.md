@@ -27,6 +27,47 @@ Automate PR preparation and review. Two distinct modes — detect which one the 
 
 ## Mode 1 — PR Preparation Workflow
 
+### Phase 0: Resume Detection
+
+**Always run this first before Phase 1.** Detects if a previous run was interrupted and resumes from the right point instead of starting over.
+
+```bash
+# Check for in-progress merge
+ls .git/MERGE_HEAD 2>/dev/null && echo "MERGE_IN_PROGRESS"
+
+# Check for in-progress rebase
+ls -d .git/rebase-merge .git/rebase-apply 2>/dev/null && echo "REBASE_IN_PROGRESS"
+
+# Check for leftover auto-stash from a previous run
+git stash list | grep "pr-prep-auto-stash"
+
+# Check if branch is already synced with target
+git rev-list --left-right --count origin/TARGET_BRANCH...HEAD
+```
+
+**Resume rules:**
+
+| Detected state | Action |
+|---------------|--------|
+| `MERGE_IN_PROGRESS` | Check if all conflicts are resolved → if yes: run `git merge --continue` and jump to Phase 3. If no: show remaining conflicted files + fix instructions, stop. |
+| `REBASE_IN_PROGRESS` | Same as above but use `git rebase --continue` |
+| `pr-prep-auto-stash` exists | Remind: "A stash from a previous run exists. It will be restored at the end of sync (Phase 2)." Continue normally. |
+| Branch already synced (BEHIND == 0) | Skip Phase 2 sync entirely, jump to Phase 3 |
+| None of the above | Fresh run — proceed with Phase 1 normally |
+
+**Checking if merge/rebase conflicts are fully resolved:**
+```bash
+git diff --name-only --diff-filter=U
+# Empty output = all resolved. Non-empty = still has conflicts.
+```
+Also scan for leftover conflict markers:
+```bash
+grep -rl "<<<<<<< " . --include="*.ts" --include="*.js" --include="*.py" --include="*.go" --include="*.rb" --include="*.java" --include="*.yaml" --include="*.yml" --include="*.json" 2>/dev/null
+```
+If markers found → list those files and stop: `Conflict markers still present in: [files]. Resolve them before re-running.`
+
+---
+
 ### Phase 1: Git State Validation
 
 Run these checks in order. Stop and report if any critical check fails.
@@ -89,18 +130,30 @@ git fetch origin 2>&1
 git ls-remote --heads origin TARGET_BRANCH
 ```
 Inspect fetch output before proceeding:
-- If output contains `Permission denied` or `Authentication failed` → stop:
+- If output contains `Permission denied` or `Authentication failed` → pause:
   ```
-  ⚠ Remote authentication failed. Possible fixes:
-    - SSH: run `ssh-add ~/.ssh/id_rsa` (or your key path)
-    - HTTPS: run `git credential approve` or re-enter credentials
-    - Check remote URL: git remote get-url origin
+  ⏸ PAUSED — Remote authentication failed
+
+  Fix steps (choose one):
+    SSH key issue:
+      ssh-add ~/.ssh/id_rsa        (or your key path)
+      ssh -T git@github.com        (verify connection)
+    HTTPS credentials:
+      git config --global credential.helper osxkeychain   (Mac)
+      git credential reject <url>  (clear bad credentials)
+    Wrong remote URL?
+      git remote get-url origin
+      git remote set-url origin <correct-url>
+
+  After fixing, re-run: /cpr TARGET_BRANCH
+  The skill will retry the fetch and continue from here.
   ```
-- If output contains `Could not resolve host` or `network` errors → warn:
+- If output contains `Could not resolve host` or `network` errors → warn and continue with local cache:
   ```
-  ⚠ Could not reach remote. Continuing with local cache — remote state may be stale.
+  ⚠ Could not reach remote — using local cache. Remote state may be stale.
+  Re-run /cpr once network is restored to get a fresh sync.
   ```
-  Continue with locally cached `origin/TARGET_BRANCH` if it exists; otherwise stop.
+  Continue with locally cached `origin/TARGET_BRANCH` if it exists; otherwise pause with: `No local cache for origin/TARGET_BRANCH. Restore network and re-run: /cpr TARGET_BRANCH`
 - If target branch not found on remote → stop: `Target branch 'TARGET_BRANCH' not found on remote. Check the branch name.`
 
 **1.7 Check if current branch already merged**
@@ -170,37 +223,43 @@ Check for conflicts:
 git diff --name-only --diff-filter=U
 ```
 
-**2.5 CONFLICT DETECTED → STOP IMMEDIATELY**
+**2.5 CONFLICT DETECTED → PAUSE (do NOT abort)**
 
-If any conflicts are found, abort the merge/rebase and display:
+If any conflicts are found, **do not abort the merge/rebase**. Leave it in progress so the user can resolve and resume. Display:
 
 ```
-🚫 MERGE CONFLICT DETECTED — PR PREPARATION HALTED
+⏸ PAUSED — Merge conflict detected in CURRENT_BRANCH → TARGET_BRANCH
 
-Conflicts in the following files:
-  • src/auth/login.ts         (both modified)
-  • config/settings.yaml      (deleted by us, modified by them)
+Conflicted files:
+  • src/auth/login.ts         [both modified]
+  • config/settings.yaml      [deleted by us, modified by them]
 
-What to do next:
-  1. Resolve conflicts manually in each file listed above
-  2. Remove all conflict markers (<<<<<<<, =======, >>>>>>>)
-  3. Stage resolved files: git add <file>
-  4. Complete the sync:
-     - For merge:  git merge --continue
-     - For rebase: git rebase --continue
-  5. Re-run this skill after conflicts are resolved
+Fix steps:
+  1. Open each conflicted file in your editor
+  2. Resolve all conflict markers:
+       <<<<<<< HEAD          ← your changes
+       =======
+       >>>>>>> origin/main   ← their changes
+  3. After resolving each file:
+       git add src/auth/login.ts
+       git add config/settings.yaml
+  4. Verify no markers remain:
+       grep -r "<<<<<<< " . --include="*.ts" --include="*.js"
+  5. Re-run:  /cpr TARGET_BRANCH
 
-Aborting merge/rebase now...
+When you re-run, this skill will detect the resolved merge and
+continue automatically from Phase 3 — no need to start over.
 ```
 
-Then run:
-```bash
-git merge --abort    # if merge strategy
-# OR
-git rebase --abort   # if rebase strategy
+For binary file conflicts, add:
+```
+⚠ Binary conflict: [filename]
+  Choose one version:
+    Keep yours:   git checkout --ours   [filename]  && git add [filename]
+    Keep theirs:  git checkout --theirs [filename]  && git add [filename]
 ```
 
-**Do not continue to Phase 3 if conflicts exist.**
+**Do not call `git merge --abort` or `git rebase --abort` — leave the merge in progress for resume.**
 
 **2.6 Check for binary file conflicts**
 ```bash
@@ -216,17 +275,27 @@ If stash pop results in conflicts:
 ```bash
 git diff --name-only --diff-filter=U
 ```
-If conflicts found → warn immediately:
+If conflicts found → pause and display:
 ```
-⚠ Auto-stash restore caused conflicts. Your stash was NOT automatically applied cleanly.
+⏸ PAUSED — Auto-stash restore caused conflicts
+
+Your stashed uncommitted changes conflict with the synced branch.
 Conflicted files:
   • [list files]
-To resolve:
-  1. Fix conflicts in each file listed above
-  2. Run: git stash drop stash@{0}   (once you're done)
-  Your original uncommitted changes are still in: git stash show stash@{0}
+
+Fix steps:
+  1. Resolve conflicts in each file listed above
+  2. Stage resolved files:
+       git add <file>
+  3. Drop the used stash entry:
+       git stash drop stash@{0}
+  4. Re-run: /cpr TARGET_BRANCH
+
+The sync with TARGET_BRANCH is already complete — re-running will
+skip straight to Phase 3 (change analysis). No sync will be repeated.
 ```
-Do not continue silently — always surface stash pop failures.
+
+Do not continue processing after a stash pop conflict — surface it immediately and wait for re-run.
 
 **2.8 Check if diff is empty after sync**
 ```bash
@@ -396,9 +465,9 @@ This allows reviewers to comment before it's marked ready.
 
 ---
 
-### Phase 5: Output Summary
+### Phase 5: Output Summary + Auto-Create PR
 
-Present the full PR preparation summary:
+**5.1 Print the full summary first**
 
 ```
 ✅ PR PREPARATION COMPLETE
@@ -422,12 +491,101 @@ PR DESCRIPTION:
 README UPDATE:  Not needed (internal fix)
 FLOW DIAGRAM:   Not applicable
 DRAFT PR:       Not recommended
+```
 
+**5.2 Auto-create the PR on GitHub**
+
+After printing the summary, immediately attempt to create the PR automatically.
+
+**Step 1 — Check if gh CLI is available and authenticated:**
+```bash
+which gh 2>/dev/null && gh auth status 2>&1
+```
+
+If gh is NOT available or NOT authenticated → skip auto-create and fall back:
+```
+⚠ Could not auto-create PR — gh CLI is not available or not authenticated.
+Run manually:
+  gh pr create --title "TITLE" --body "DESCRIPTION" --base TARGET_BRANCH
+Or install gh: https://cli.github.com
+```
+
+**Step 2 — Push branch to remote if not already pushed:**
+```bash
+git push -u origin CURRENT_BRANCH 2>&1
+```
+- If push fails due to upstream divergence → pause:
+  ```
+  ⏸ PAUSED — Push failed (remote branch has diverged)
+
+  Your local CURRENT_BRANCH is behind its remote counterpart.
+  Fix steps:
+    git pull origin CURRENT_BRANCH --rebase
+    # resolve any conflicts if they appear
+    git push -u origin CURRENT_BRANCH
+
+  After pushing, re-run: /cpr TARGET_BRANCH
+  PR title and description are already generated — re-running will
+  skip analysis and go straight to creating the PR.
+  ```
+- If push fails due to auth → pause:
+  ```
+  ⏸ PAUSED — Push failed (authentication error)
+
+  Fix steps:
+    SSH:   ssh-add ~/.ssh/id_rsa
+    HTTPS: git config --global credential.helper osxkeychain
+
+  After fixing credentials, re-run: /cpr TARGET_BRANCH
+  ```
+- If push fails because branch is protected or requires PR → pause:
+  ```
+  ⏸ PAUSED — Direct push rejected (branch protection rules)
+
+  CURRENT_BRANCH may be a protected branch.
+  Ensure you are on your feature branch, not on TARGET_BRANCH itself.
+  Current branch: CURRENT_BRANCH
+  Target:         TARGET_BRANCH
+  ```
+
+**Step 3 — Create the PR:**
+
+If draft was recommended in step 4.5:
+```bash
+gh pr create \
+  --title "GENERATED_TITLE" \
+  --body "GENERATED_DESCRIPTION" \
+  --base TARGET_BRANCH \
+  --draft
+```
+
+Otherwise:
+```bash
+gh pr create \
+  --title "GENERATED_TITLE" \
+  --body "GENERATED_DESCRIPTION" \
+  --base TARGET_BRANCH
+```
+
+**Step 4 — Report the result:**
+
+On success:
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 PR CREATED SUCCESSFULLY
+URL: https://github.com/owner/repo/pull/123
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 NEXT STEPS:
-  1. Review the PR description above
-  2. Create PR: gh pr create --title "..." --body "..."
-  3. Assign reviewers and labels per team convention
+  1. Open the PR URL above and verify the description looks correct
+  2. Assign reviewers and labels per team convention
+  3. If anything needs fixing: gh pr edit 123 --title "..." --body "..."
+```
+
+On failure (any gh error):
+```
+⚠ PR creation failed: [error message from gh]
+Run manually:
+  gh pr create --title "TITLE" --body "DESCRIPTION" --base TARGET_BRANCH
 ```
 
 ---
@@ -653,7 +811,7 @@ review:
 | `origin` remote missing | List available remotes, ask which to use |
 | No remotes at all | Stop, instruct to add remote |
 | Uncommitted changes | Warn, ask user: stash / commit / abort |
-| Stash pop causes conflicts | Warn explicitly, show conflicted files, do not hide |
+| Stash pop causes conflicts | PAUSE — show conflicted files + fix steps, re-run skips sync and resumes at Phase 3 |
 | Target branch not on remote | Stop, verify branch name |
 | Branch already merged | Warn, may be duplicate work |
 | PR already open | Warn with existing PR link |
@@ -661,10 +819,10 @@ review:
 | PR previously closed (unmerged) | Warn: previously rejected change |
 | gh CLI not authenticated | Warn, suggest `gh auth login`, skip PR detection |
 | gh CLI not available | Skip PR detection, skip PR creation commands |
-| Fetch authentication failure (SSH/HTTPS) | Stop with specific fix instructions |
-| Fetch network failure | Warn, continue with local cache if available |
-| Merge conflict detected | Stop, abort merge/rebase, show conflict details |
-| Binary file conflict | Call out explicitly |
+| Fetch authentication failure (SSH/HTTPS) | PAUSE — show SSH/HTTPS fix steps, re-run resumes from fetch |
+| Fetch network failure | Warn, continue with local cache if available, re-run retries |
+| Merge conflict detected | PAUSE — leave merge in progress, show per-file fix steps, re-run auto-resumes at Phase 3 |
+| Binary file conflict | PAUSE — show `checkout --ours/--theirs` commands per file |
 | Empty diff after sync | Warn, may be no-op PR |
 | 0 commits ahead of target | Stop, warn branch has nothing to PR |
 | Branch 50+ commits behind | Warn before syncing |
@@ -682,7 +840,7 @@ review:
 ## Important Behavioral Rules
 
 1. **Never assume target branch is `main`** — always ask if not provided
-2. **Never continue past a conflict** — abort and show clear instructions
+2. **Never abort a merge/rebase on conflict** — leave it in progress, PAUSE with fix steps, let the user resolve and re-run
 3. **Never fabricate business context** — only use what is evident from diff, commits, and branch name
 4. **Label all inferences** — `[Inferred from diff]`, `[Inferred from branch name]`
 5. **Never include secrets in PR text** — scan for tokens/keys in diff and redact
@@ -691,6 +849,9 @@ review:
 8. **Prefer Mermaid diagrams** — never generate vague text-only "mind maps"
 9. **Review comments must be actionable** — always include "Suggested fix" for critical/medium issues
 10. **Adapt template to change type** — do not force bug-fix language onto a refactor or feature PR
+11. **Always run Phase 0 on every invocation** — detect state before assuming a fresh run
+12. **Every PAUSE must include a re-run instruction** — always end with `Re-run: /cpr TARGET_BRANCH` so the user knows exactly what to do next
+13. **Never make the user start over** — if work was already done in a previous run (sync complete, analysis done), skip those phases on resume
 
 ---
 

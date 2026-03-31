@@ -28,8 +28,8 @@ Use these slash commands for the fastest workflow. All commands accept an option
 
 | Command | What it does | When to use |
 |---------|-------------|-------------|
-| `/cpr` | Prepare branch for PR → `main` | Before raising a PR — syncs, checks conflicts, generates title + description |
-| `/cpr develop` | Prepare branch for PR → `develop` | Same as above but targets a different base branch |
+| `/cpr` | Prepare + auto-create PR → `main` | Syncs, checks conflicts, generates title + description, then creates the PR on GitHub automatically |
+| `/cpr develop` | Prepare + auto-create PR → `develop` | Same as above but targets a different base branch |
 | `/rpr` | Review current branch diff vs `main` | After writing code, before raising — catches issues early |
 | `/rpr develop` | Review diff vs `develop` | Review against a non-main base |
 | `/fpr` | Full workflow: prep + review → `main` | When you want everything in one shot |
